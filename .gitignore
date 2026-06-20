@@ -8,3 +8,7 @@ venv/
 *.egg-info/
 dist/
 build/
+
+# Training artifacts (large model checkpoints, transient logs)
+takemeter-model*/
+train_log.txt
