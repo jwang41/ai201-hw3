@@ -188,20 +188,50 @@ seeded split, same locked 374-item test set; reproduced by
 | **True `0`** | 279 | 61 |
 | **True `1`** | 13 | 21 |
 
-**What the re-fine-tune showed.** Weighting did exactly what it is designed to do:
-`Special` **recall more than doubled, 0.26 → 0.62** (the model now catches 21 of
-34 specials instead of 9). But it flipped the failure mode — the model now
-*over*-predicts `Special`, so precision collapsed (0.75 → 0.26, with 61 false
-positives) and both accuracy and macro-F1 fell. Net `Special` F1 is essentially
-unchanged (0.39 → 0.36).
+**What the re-fine-tune showed (interim).** Weighting did exactly what it is
+designed to do: `Special` **recall more than doubled, 0.26 → 0.62**. But at the
+default 0.50 cutoff it flipped the failure mode — over-predicting `Special`,
+precision 0.75 → 0.26. That is not the end of the story: the 0.50 cutoff is
+arbitrary, so the next step (§5.4) tunes it properly.
 
-**Conclusion: neither model is deployable, and the trade-off is the finding.** One
-model is silent about specials; the other is trigger-happy. Moving the loss weight
-only slides the operating point along the precision/recall curve — it does not
-create new signal. The real bottleneck is the **tiny, partly-noisy `Special`
-class (157 training examples)**, so the highest-value next steps are *data* (more
-and cleaner `Special` examples) and *threshold calibration*, not just reweighting
-(see §7).
+### 5.4 Threshold calibration (best result)
+
+Argmax classification is really a **0.50 cutoff on P(`Special`)** — an arbitrary
+choice. I swept the cutoff on the **validation** set and only then measured the
+**test** set, so the operating point is never tuned on test data. Reproduced by
+[`calibrate_threshold.py`](calibrate_threshold.py) (loads the §5.3 checkpoint,
+no retraining; writes `evaluation_results_calibrated.json` and
+`confusion_matrix_calibrated.png`). Two operating points were selected on
+validation — the cutoff that **maximizes macro-F1**, and the cutoff that hits a
+**recall target of ≥ 0.70**.
+
+**Full comparison (test set, 374 items):**
+
+| Model / operating point | Cutoff | Accuracy | Macro-F1 | `Special` P | `Special` R | `Special` F1 |
+|---|---|---|---|---|---|---|
+| §5.1 unweighted | argmax | 0.925 | 0.68 | 0.75 | 0.26 | 0.39 |
+| §5.3 weighted, default | 0.50 | 0.802 | 0.62 | 0.26 | 0.62 | 0.36 |
+| **§5.4 weighted, max-macro-F1** | **0.85** | **0.917** | **0.70** | 0.57 | 0.35 | **0.44** |
+| §5.4 weighted, recall-target | 0.45 | 0.757 | 0.61 | 0.24 | **0.76** | 0.36 |
+
+**Findings.**
+- **Calibration gives the best model overall.** At cutoff **0.85**, the weighted
+  model reaches **macro-F1 0.70 and `Special` F1 0.44** — both beating the
+  original unweighted model (0.68 / 0.39) — while restoring accuracy to 0.92.
+  Most of the §5.3 "regression" was simply a bad threshold, not a worse model.
+- **The recall target is reachable but expensive.** Tuning for recall ≥ 0.70
+  hits **test recall 0.76** (catches 26 of 34 specials), but precision falls to
+  **0.24** — roughly 3 of every 4 flagged items are false alarms. That is the
+  honest cost of high recall on this data.
+- **Caveat:** validation and test each contain only **34 `Special` items**, so
+  these thresholds are estimated on very few positives and are not stable — the
+  exact cutoffs would shift on a larger sample.
+
+**Conclusion.** Threshold calibration is the highest-value knob tried: it lifts
+the *balanced* metrics to the best of any run. But **no configuration is
+deployable as an auto-tagger** — you can have decent precision *or* recall ≥ 0.70,
+not both. The wall is the **tiny, partly-noisy `Special` class (157 training
+examples)**; the genuine fix is more and cleaner `Special` data (see §7).
 
 ---
 
@@ -248,25 +278,25 @@ For the intended use — automatically surfacing a restaurant's special items �
 metric that matters is **recall on `Special`**: we want to catch the specials,
 and a few false positives are tolerable.
 
-- **Current state:** `Special` recall = 0.26. The tool would miss roughly
-  three-quarters of specials, so it is **not good enough to deploy** as an
-  automatic tagger, despite the flattering 92.5% accuracy.
-- **A reasonable bar for usefulness** would be `Special` recall ≥ 0.70 while
+- **Best achievable now:** after class weighting + threshold calibration (§5.4),
+  the best operating point reaches macro-F1 **0.70** / `Special` F1 **0.44**, and
+  recall ≥ 0.70 is reachable but only at precision ~0.24.
+- **A reasonable bar for usefulness** would be `Special` recall ≥ 0.70 *while*
   keeping precision high enough to avoid drowning real specials in false
-  positives — i.e. a macro-F1 in the ~0.75+ range rather than today's 0.68.
+  positives — i.e. a macro-F1 in the ~0.75+ range. **No configuration tried clears
+  that bar**, so it is **not good enough to deploy** as a fully automatic tagger.
 - **As an assistive tool** (surfacing *candidate* specials for a human to
-  confirm) the current model has limited value, and only if the reviewer knows it
-  misses most specials.
+  confirm) the calibrated model is borderline useful — at recall 0.76 a reviewer
+  would see ~3 false alarms per real special, which may or may not be acceptable.
 
 ### What I would do next
-1. **Imbalance — tried, partly works (see §5.3).** Class-weighted loss lifted
-   `Special` recall 0.26 → 0.62 but tanked precision to 0.26. Reweighting alone
-   only moves the operating point; the next lever is **threshold calibration**
-   (pick the `Special` probability cutoff that hits a target recall at acceptable
-   precision) rather than more weighting.
+1. **Imbalance + calibration — tried (§5.3–5.4).** Class weighting plus a
+   validation-tuned threshold gave the best balanced result (macro-F1 0.70), but
+   these two knobs only slide the operating point along a fixed precision/recall
+   curve. They cannot push the curve outward — that needs better signal.
 2. **Get more / cleaner `Special` data** — with only 157 `Special` training
-   examples, this is the real ceiling. More labeled specials would help both
-   recall and precision in a way reweighting cannot.
+   examples, this is the real ceiling. More labeled specials would move the whole
+   curve up in a way reweighting and thresholding cannot.
 3. **Clean the data** — drop or repair rows with empty `text`; consider using the
    `name` field as an extra signal.
 4. **Tighten the label definition** and re-check the noisiest examples, since some
@@ -288,13 +318,16 @@ and a few false positives are tolerable.
    will hit HTTP 429 partway through (as it did here). Metrics are written to
    `evaluation_results.json`.
 
-The §5.3 class-weighted re-fine-tune runs **locally on CPU** (no Colab needed):
+The §5.3–5.4 experiments run **locally on CPU** (no Colab needed):
 ```bash
 pip install -r requirements.txt
-python finetune_weighted.py        # writes evaluation_results_weighted.json + confusion_matrix_weighted.png
+python finetune_weighted.py        # §5.3: class-weighted fine-tune -> *_weighted.{json,png}
+python calibrate_threshold.py      # §5.4: threshold sweep -> *_calibrated.{json,png}
 ```
+`calibrate_threshold.py` loads the checkpoint saved by `finetune_weighted.py`, so
+run them in order.
 > Note: on Windows, `import torch` must come before `numpy`/`pandas` or torch's
-> `c10.dll` fails to load (WinError 1114); the script already orders imports this
+> `c10.dll` fails to load (WinError 1114); the scripts already order imports this
 > way.
 
 ### Repository layout
@@ -304,12 +337,15 @@ ai201-hw3/
 ├── planning.md                        # working notes / design doc
 ├── takemeter_starter.ipynb            # training + evaluation pipeline (Colab)
 ├── finetune_weighted.py               # §5.3 class-weighted re-fine-tune (local CPU)
+├── calibrate_threshold.py             # §5.4 threshold calibration (local CPU)
 ├── config.py                          # Groq model + data path settings
 ├── data/menu_item.csv                 # labeled dataset (2,491 items)
 ├── confusion_matrix.png               # unweighted model (§5.1)
 ├── confusion_matrix_weighted.png      # class-weighted model (§5.3)
+├── confusion_matrix_calibrated.png    # calibrated operating point (§5.4)
 ├── evaluation_results.json            # unweighted metrics
-└── evaluation_results_weighted.json   # class-weighted metrics
+├── evaluation_results_weighted.json   # class-weighted metrics
+└── evaluation_results_calibrated.json # calibrated metrics (all operating points)
 ```
 
 ---
